@@ -1,0 +1,74 @@
+name: ETF daily
+
+# 每个交易日北京时间 17:10（UTC 09:10）自动运行；也可手动触发
+on:
+  schedule:
+    - cron: '10 9 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: etf-daily
+  cancel-in-progress: false
+
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 复用上次的数据库，避免每天重新回填
+      - name: Restore db
+        uses: actions/cache@v4
+        with:
+          path: etf.db
+          key: etfdb-${{ github.run_id }}
+          restore-keys: |
+            etfdb-
+
+      - name: Backfill if no db
+        run: |
+          if [ -f etf.db ]; then
+            echo "db exists, skip backfill"
+          else
+            echo "no db, running full backfill"
+            python etf_flow.py --backfill
+          fi
+
+      - name: Daily update
+        run: python etf_flow.py --daily
+
+      - name: Commit results
+        run: |
+          git config user.name  "etf-bot"
+          git config user.email "etf-bot@users.noreply.github.com"
+          git add chart.png data.json
+          if git diff --staged --quiet; then
+            echo "no change"
+          else
+            git commit -m "update $(TZ=Asia/Shanghai date +%F)"
+            git push
+          fi
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: etf-chart
+          path: |
+            chart.png
+            data.json
+          retention-days: 90
