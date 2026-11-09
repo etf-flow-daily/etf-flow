@@ -202,8 +202,11 @@ def redraw_only(pts, idx_map, doc, tag=""):
         sys.path.insert(0, HERE)
         from chart import render
         idx_series = [(d, idx_map[d]) for d in sorted(idx_map) if d >= pts[0]["d"]]
+        # 用「本次运行时间」而非 data.json 里的旧时间，否则无新增日时
+        # 图上会一直显示旧的生成时间，看起来像没更新
+        gen = now_cst().strftime("%Y-%m-%d %H:%M")
         caption = ("数据截至 %s ｜ 本图生成 %s（北京时间） ｜ 最新 %+.1f 亿元"
-                   % (pts[-1]["d"], doc.get("updated", ""), pts[-1]["v"]))
+                   % (pts[-1]["d"], gen, pts[-1]["v"]))
         render(pts, idx_series, PNG,
                note=("数据源：上交所 / 深交所官方基金份额，东方财富行情    "
                      "覆盖全市场 %d 只权益类 ETF" % doc.get("etf_count", 0)),
