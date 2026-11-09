@@ -99,28 +99,100 @@ def szse_shares(a, b):
 
 # ------------------------------------------------------------------ 行情
 def secid(code):
+    # 上证指数 000001 必须用 1.000001，否则命中 0.000001（平安银行，约 11 元）
+    if code == "000001":
+        return "1.000001"
     return ("0." if code[:2] in ("15", "16", "00", "12") else "1.") + code
 
 
-def kline(code, beg, end, tries=3):
-    """返回 (code, {date: close})"""
+def _kline_em(code, beg, end):
     q = urllib.parse.urlencode({
         "secid": secid(code), "fields1": "f1,f2,f3", "fields2": "f51,f53",
         "klt": "101", "fqt": "0", "beg": beg.replace("-", ""),
         "end": end.replace("-", ""), "lmt": "1000"})
     url = "https://push2his.eastmoney.com/api/qt/stock/kline/get?" + q
-    try:
-        js = json.loads(http(url, {"User-Agent": UA}, timeout=40, tries=tries)
-                        .decode("utf-8", "ignore"))
-        kl = (js.get("data") or {}).get("klines") or []
-        out = {}
-        for line in kl:
-            p = line.split(",")
-            if len(p) >= 2:
-                out[p[0]] = float(p[1])
-        return code, out
-    except Exception:
-        return code, {}
+    js = json.loads(http(url, {"User-Agent": UA}, timeout=40, tries=2)
+                    .decode("utf-8", "ignore"))
+    kl = (js.get("data") or {}).get("klines") or []
+    out = {}
+    for line in kl:
+        p = line.split(",")
+        if len(p) >= 2:
+            out[p[0]] = float(p[1])
+    return out
+
+
+def _kline_sina(code, beg, end):
+    sym = ("sh" if code == "000001" or code.startswith(("5", "6")) else "sz") + code
+    url = ("https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+           "CN_MarketData.getKLineData?symbol=%s&scale=240&ma=no&datalen=1023" % sym)
+    txt = http(url, {"User-Agent": UA, "Referer": "https://finance.sina.com.cn/"},
+               timeout=40, tries=2).decode("utf-8", "ignore").strip()
+    if not txt or txt in ("null", "[]"):
+        return {}
+    if txt[0] not in "[{":
+        i, j = txt.find("["), txt.rfind("]")
+        if i < 0 or j < 0:
+            return {}
+        txt = txt[i:j + 1]
+    arr = json.loads(txt)
+    out = {}
+    for r in arr:
+        d = str(r.get("day") or "")[:10]
+        c = r.get("close")
+        if d and c is not None:
+            try:
+                v = float(c)
+            except Exception:
+                continue
+            if beg <= d <= end:
+                out[d] = v
+    return out
+
+
+def _kline_tx(code, beg, end):
+    sym = ("sh" if code == "000001" or code.startswith(("5", "6")) else "sz") + code
+    url = ("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?"
+           "param=%s,day,%s,%s,640,qfq" % (sym, beg, end))
+    js = json.loads(http(url, {"User-Agent": UA}, timeout=40, tries=2)
+                    .decode("utf-8", "ignore"))
+    node = (js.get("data") or {}).get(sym) or {}
+    arr = node.get("day") or node.get("qfqday") or []
+    out = {}
+    for row in arr:
+        if len(row) >= 3:
+            try:
+                out[str(row[0])[:10]] = float(row[2])
+            except Exception:
+                continue
+    return out
+
+
+def kline(code, beg, end):
+    """返回 (code, {date: close})。东方财富在海外 runner 上常被拦，
+    因此依次尝试 东方财富 -> 新浪 -> 腾讯，任一成功即用。"""
+    for name, fn in (("eastmoney", _kline_em), ("sina", _kline_sina), ("tencent", _kline_tx)):
+        try:
+            m = fn(code, beg, end)
+            if m:
+                print("  %s 日线取自 %s（%d 个交易日）" % (code, name, len(m)))
+                return code, m
+            print("  %s 源 %s 返回空" % (code, name))
+        except Exception as e:
+            print("  %s 源 %s 失败：%s" % (code, name, str(e)[:100]))
+    return code, {}
+
+
+def candidate_days(last, today):
+    """last 之后到 today 之间的工作日，用于指数全挂时探测交易日。"""
+    d = datetime.strptime(last, "%Y-%m-%d") + timedelta(days=1)
+    end = datetime.strptime(today, "%Y-%m-%d")
+    out = []
+    while d <= end:
+        if d.weekday() < 5:
+            out.append(d.strftime("%Y-%m-%d"))
+        d += timedelta(days=1)
+    return out
 
 
 # ------------------------------------------------------------------ 主流程
@@ -151,10 +223,23 @@ def main():
 
     # 指数日线：既当交易日历，也当右轴数据（一次请求覆盖全区间）
     _, idx_map = kline("000001", pts[0]["d"], today)
-    if not idx_map:
-        print("❗指数日线抓取失败，无法判断交易日，退出")
-        return 1
-    new_days = sorted(d for d in idx_map if d > last)
+    if idx_map:
+        new_days = sorted(d for d in idx_map if d > last)
+    else:
+        # 三个数据源都失败：改用交易所份额探测交易日，不中断任务
+        print("！指数全源失败，改用交易所份额判断交易日（本次图可能缺橙线）")
+        new_days = []
+        for d in candidate_days(last, today):
+            try:
+                if len(sse_shares(d)) >= MIN_ROWS:
+                    new_days.append(d)
+                    print("  探测到交易日 %s" % d)
+            except Exception as e:
+                print("  %s 探测失败：%s" % (d, str(e)[:80]))
+        if not new_days:
+            print("没有新交易日，仅重绘")
+            redraw_only(pts, idx_map, doc, tag="无新交易日")
+            return 0
     if not new_days:
         print("没有新交易日，仅重绘")
         redraw_only(pts, idx_map, doc, tag="无新交易日")
@@ -212,6 +297,11 @@ def main():
     last_share = {c: sh for c, (nm, sh) in base.items() if c not in bad}
     added = 0
     for d in new_days:
+        # 份额尚未披露时该日条数会异常少（甚至 0），必须跳过，否则写入 +0.0 假点污染曲线
+        if len(per_day.get(d, {})) < MIN_ROWS:
+            print("  %s 份额尚未披露（仅 %d 条 <%d），跳过该日"
+                  % (d, len(per_day.get(d, {})), MIN_ROWS))
+            continue
         flow, cnt = 0.0, 0
         for c, (nm, sh) in per_day.get(d, {}).items():
             if c in bad:
