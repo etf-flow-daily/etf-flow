@@ -25,6 +25,43 @@ jobs:
         with:
           python-version: '3.12'
 
+      # GitHub runner 默认无中文字体，不装会导致图中中文全为方块
+      - name: Install Chinese fonts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk
+          fc-cache -f || true
+          rm -rf ~/.cache/matplotlib
+          fc-list | grep -ci cjk || echo "warn: no cjk font"
+
+      # 运行时修正脚本：上证指数代码 + 份额未披露时跳过（幂等，可重复执行）
+      - name: Patch daily_append.py
+        run: |
+          python - <<'PY'
+          p = 'daily_append.py'
+          s = open(p, encoding='utf-8').read()
+
+          o1 = '    return ("0." if code[:2] in ("15", "16", "00", "12") else "1.") + code'
+          n1 = '    return ("1." if code == "000001" else "0." if code[:2] in ("15", "16", "00", "12") else "1.") + code'
+
+          o2 = '    for d in new_days:\n        flow, cnt = 0.0, 0\n'
+          n2 = ('    for d in new_days:\n'
+                '        if len(per_day.get(d, {})) < MIN_ROWS:\n'
+                '            print("  %s 份额未披露，跳过该日" % d)\n'
+                '            continue\n'
+                '        flow, cnt = 0.0, 0\n')
+
+          if o1 in s:
+              s = s.replace(o1, n1, 1)
+              print('patched: index code 1.000001')
+          if o2 in s:
+              s = s.replace(o2, n2, 1)
+              print('patched: skip unpublished day')
+          open(p, 'w', encoding='utf-8').write(s)
+          print('patch done')
+          PY
+          python -c "import ast;ast.parse(open('daily_append.py',encoding='utf-8').read());print('syntax OK')"
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
@@ -38,7 +75,9 @@ jobs:
         run: |
           git config user.name  "etf-bot"
           git config user.email "etf-bot@users.noreply.github.com"
-          git add chart.png data.json
+          for f in chart.png data.json; do
+            if [ -f "$f" ]; then git add "$f"; else echo "skip missing $f"; fi
+          done
           if git diff --staged --quiet; then
             echo "no change"
           else
@@ -51,6 +90,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: etf-chart
+          if-no-files-found: warn
           path: |
             chart.png
             data.json
