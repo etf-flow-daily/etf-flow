@@ -16,7 +16,7 @@ concurrency:
 jobs:
   daily:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -30,26 +30,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 复用上次的数据库，避免每天重新回填
-      - name: Restore db
-        uses: actions/cache@v4
-        with:
-          path: etf.db
-          key: etfdb-${{ github.run_id }}
-          restore-keys: |
-            etfdb-
-
-      - name: Backfill if no db
-        run: |
-          if [ -f etf.db ]; then
-            echo "db exists, skip backfill"
-          else
-            echo "no db, running full backfill"
-            python etf_flow.py --backfill
-          fi
-
-      - name: Daily update
-        run: python etf_flow.py --daily
+      # 轻量增量：以仓库内 data.json 的末点为基线，只补新交易日
+      - name: Daily incremental update
+        run: python daily_append.py
 
       - name: Commit results
         run: |
